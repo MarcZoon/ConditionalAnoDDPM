@@ -1,0 +1,174 @@
+import os
+import random
+import sys
+from typing import Union
+
+import h5py
+import numpy as np
+import torch
+import torchio as tio
+import torchvision as tio
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+
+from .logger import log
+
+
+def load_data(
+    *,
+    file_path: str,
+    batch_size: int,
+    split: str,
+    organs: Union[str, list] = "all",
+    labels: str = "healthy",
+    deterministic: bool = False,
+    transform=None,
+    class_cond=False,
+):
+    if not file_path:
+        raise ValueError("unspecified file path")
+
+    if USE_MPI:
+        h5file = h5py.File(file_path, mode="r", driver="mpio", comm=MPI.COMM_WORLD)
+    else:
+        h5file = h5py.File(file_path, mode="r")
+
+    if transform is None:
+        transform_list = []
+        if split == "train":
+            transform_list.append(transforms.RandomAffine(3, (0.02, 0.09)))
+        transform_list += [
+            transforms.Normalize(0.5, 0.5),
+        ]
+        transform = transforms.Compose(transform_list)
+
+    dataset = HDF5Dataset(
+        hdf5file=h5file,
+        split=split,
+        organs=organs,
+        labels=labels,
+        shard=MPI.COMM_WORLD.Get_rank() if USE_MPI else 0,
+        num_shards=MPI.COMM_WORLD.Get_size() if USE_MPI else 1,
+        transform=transform,
+        class_cond=class_cond,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=not deterministic,
+        num_workers=1,
+        drop_last=True,
+        pin_memory=True,
+    )
+    while True:
+        yield from loader
+
+
+class HDF5Dataset(Dataset):
+    def __init__(
+        self,
+        hdf5file: h5py.File,
+        split: str,
+        organs: Union[str, list],
+        labels: str,
+        shard: int = 0,
+        num_shards: int = 1,
+        transform=None,
+        class_cond: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.h5file = hdf5file
+        self.split = split
+        self.class_cond = class_cond
+        self.transform = transform
+
+        if organs == "all":
+            self.organs = list(hdf5file[split].keys())
+        elif isinstance(organs, str):
+            self.organs = organs.split(",")
+        else:
+            self.organs = organs
+
+        self.labels = []
+        self.items = []
+        for organ in self.organs:
+            for label in self.h5file[split][organ].keys():
+                self.labels.append(f"{organ}_{label}")
+                if label in labels or "all" in labels:
+                    slices = [s for s in self.h5file[split][organ][label].keys()]
+                    for s in slices:
+                        self.items.append((organ, label, s))
+
+        random.Random(42).shuffle(self.items)
+        self.local_items = self.items[shard:][::num_shards]
+        self.classes = {x: i for i, x in enumerate(sorted(set(self.labels)))}
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        organ, label, scan_id = self.items[idx]
+
+        scan_data = torch.tensor(
+            self.h5file[self.split][organ][label][f"{scan_id}"]["scan"][...]
+        )
+        scan_seg = torch.tensor(
+            self.h5file[self.split][organ][label][f"{scan_id}"]["seg"][...]
+        )
+
+        out_dict = {
+            "original_seg": scan_seg,
+            "original_scan": scan_data,
+            "organ": organ,
+            "label": label,
+            "scan_id": scan_id,
+        }
+        if self.class_cond:
+            out_dict["y"] = np.array(self.classes[f"{organ}_{label}"], dtype=np.int64)
+
+        combined = torch.cat([scan_data, scan_seg], dim=0)
+        combined = self.transform(combined) if self.transform is not None else combined
+
+        img = combined[:-1, ...]
+        out_dict["seg"] = combined[-1, ...]
+
+        if self.split != "train":
+            # For some reason we can not train on data scaled to [-1, +1], but do
+            # need that for validation/testing. So we only scale when not training.
+            # set lowest value to 0 for each channel
+            img -= torch.amin(img, dim=[1, 2]).reshape(img.shape[0], 1, 1)
+            # set max value to 1 for each channel
+            img /= torch.amax(img, dim=[1, 2]).reshape(img.shape[0], 1, 1)
+            # scale image to [-1, +1] range
+            img = 2 * img - 1
+
+        return img, out_dict
+
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    USE_MPI = False
+    data = load_data(
+        file_path="./hdf5_files/mri_combined.hdf5",
+        batch_size=2,
+        split="train",
+        organs="all",
+        labels="malignant",
+        class_cond=False,
+    )
+
+    while True:
+        b, out_dict = next(data)
+        print(out_dict)
+        plt.subplot(1, 2, 1)
+        plt.imshow(b[0, 0, ...], cmap="gray")
+        plt.subplot(1, 2, 2)
+        plt.imshow(out_dict["seg"][0, 0, ...], cmap="gray")
+        plt.show()
+else:
+    from mpi4py import MPI
+
+    USE_MPI = True
